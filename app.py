@@ -17,7 +17,7 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from core import prompts  # noqa: F401  (imported for side-effect clarity / future use)
+from core import prompts  
 from core.config import settings
 from core.confidence import ConfidenceResult
 from core.graph import run_investigation
