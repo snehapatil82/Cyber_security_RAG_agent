@@ -13,7 +13,7 @@ import re
 
 import pandas as pd
 
-from core.config import settings
+from config import settings
 
 logger = logging.getLogger("sentry.ingestion")
 
