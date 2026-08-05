@@ -1,87 +1,50 @@
 """
-core/ingestion.py — Multi-format report ingestion.
+core/confidence.py — Confidence scoring for generated answers.
 
-Supports: PDF, DOCX, TXT, CSV, XLSX, JSON.
-Pipeline: extract_text() -> chunk_text() -> (caller embeds + stores in Chroma)
+Confidence is derived from retrieval evidence quality, not from asking the
+LLM to self-report a number (which is unreliable). It combines:
+  - mean semantic similarity of retrieved chunks
+  - number of retrieved chunks
+  - diversity of trusted sources (NVD, CISA KEV, vendor advisory, uploaded report)
 """
 from __future__ import annotations
 
-import io
-import json
-import logging
-import re
-
-import pandas as pd
-
-from config import settings
-
-logger = logging.getLogger("sentry.ingestion")
-
-SUPPORTED_EXTENSIONS = {"pdf", "docx", "txt", "csv", "xlsx", "json"}
+from dataclasses import dataclass
 
 
-def extract_text(file_bytes: bytes, filename: str) -> str:
-    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-    if ext not in SUPPORTED_EXTENSIONS:
-        raise ValueError(f"Unsupported file type: .{ext}. Supported: {sorted(SUPPORTED_EXTENSIONS)}")
-
-    if ext == "pdf":
-        return _extract_pdf(file_bytes)
-    if ext == "docx":
-        return _extract_docx(file_bytes)
-    if ext == "txt":
-        return file_bytes.decode("utf-8", errors="ignore")
-    if ext == "csv":
-        return _extract_tabular(file_bytes, fmt="csv")
-    if ext == "xlsx":
-        return _extract_tabular(file_bytes, fmt="xlsx")
-    if ext == "json":
-        return _extract_json(file_bytes)
-    raise ValueError(f"Unhandled extension: {ext}")  # pragma: no cover
+@dataclass
+class ConfidenceResult:
+    score: int  # 0-100
+    label: str  # High | Medium | Low
+    num_sources: int
+    source_list: list[str]
 
 
-def _extract_pdf(file_bytes: bytes) -> str:
-    import fitz  # PyMuPDF
+def compute_confidence(retrieved: list[dict], has_live_cve_data: bool = False) -> ConfidenceResult:
+    if not retrieved and not has_live_cve_data:
+        return ConfidenceResult(score=0, label="Low", num_sources=0, source_list=[])
 
-    doc = fitz.open(stream=file_bytes, filetype="pdf")
-    return "\n".join(page.get_text() for page in doc)
+    similarities = [r.get("similarity", 0.0) for r in retrieved] or [0.0]
+    mean_sim = sum(similarities) / len(similarities)
 
+    sources = set()
+    for r in retrieved:
+        src = r.get("metadata", {}).get("source") or r.get("metadata", {}).get("cve_id") or "unknown"
+        sources.add(src)
+    if has_live_cve_data:
+        sources.add("NVD/CISA")
 
-def _extract_docx(file_bytes: bytes) -> str:
-    import docx  # python-docx
+    volume_factor = min(1.0, len(retrieved) / 4)  # 4+ chunks = full credit
+    diversity_bonus = min(0.15, 0.05 * len(sources))
 
-    document = docx.Document(io.BytesIO(file_bytes))
-    parts = [p.text for p in document.paragraphs if p.text.strip()]
-    for table in document.tables:
-        for row in table.rows:
-            parts.append(" | ".join(cell.text for cell in row.cells))
-    return "\n".join(parts)
+    raw = (mean_sim * 0.7) + (volume_factor * 0.15) + diversity_bonus
+    score = max(0, min(100, round(raw * 100)))
 
-
-def _extract_tabular(file_bytes: bytes, fmt: str) -> str:
-    if fmt == "csv":
-        df = pd.read_csv(io.BytesIO(file_bytes))
+    if score >= 75:
+        label = "High"
+    elif score >= 45:
+        label = "Medium"
     else:
-        df = pd.read_excel(io.BytesIO(file_bytes))
-    lines = [" | ".join(str(c) for c in df.columns)]
-    for _, row in df.iterrows():
-        lines.append(" | ".join(str(v) for v in row.values))
-    return "\n".join(lines)
+        label = "Low"
 
-
-def _extract_json(file_bytes: bytes) -> str:
-    data = json.loads(file_bytes.decode("utf-8", errors="ignore"))
-    return json.dumps(data, indent=2)
-
-
-def chunk_text(text: str, size: int | None = None, overlap: int | None = None) -> list[str]:
-    size = size or settings.chunk_size
-    overlap = overlap or settings.chunk_overlap
-    text = re.sub(r"\s+", " ", text).strip()
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = start + size
-        chunks.append(text[start:end])
-        start += size - overlap
-    return [c for c in chunks if len(c.strip()) > 30]
+    return ConfidenceResult(score=score, label=label, num_sources=len(sources), source_list=sorted(sources))
